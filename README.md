@@ -1,25 +1,46 @@
 # PasskeyManager
 
-A Swift 6, strict-concurrency-safe wrapper around AuthenticationServices' platform
-passkey (WebAuthn) APIs — registration, sign-in, and AutoFill/Conditional UI —
-exposed as `async`/`await`.
+[![Swift 6.0](https://img.shields.io/badge/Swift-6.0-F05138.svg?style=flat&logo=swift)](https://swift.org)
+[![Platforms](https://img.shields.io/badge/Platforms-iOS%2016%2B%20%7C%20macOS%2013%20%7C%20visionOS%201%2B-blue.svg?style=flat)]()
+[![Swift Package Manager](https://img.shields.io/badge/SPM-Compatible-orange.svg?style=flat)](https://swift.org/package-manager/)
+[![Strict Concurrency](https://img.shields.io/badge/Swift%206-Strict%20Concurrency-brightgreen.svg?style=flat)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat)](LICENSE)
 
-## Requirements
+A lightweight, Swift 6 strict-concurrency-safe `async`/`await` wrapper around Apple's **AuthenticationServices** platform passkey (WebAuthn / FIDO2) APIs.
 
-- iOS 16+, macOS 13+, visionOS 1+ (enforced via `@available`)
+Handles registration, explicit sign-in, and passive AutoFill (Conditional UI) with zero third-party dependencies.
+
+---
+
+## ✨ Features
+
+- 🔑 **Complete WebAuthn Ceremony**: Support for both credential creation (registration) and assertion (sign-in) ceremonies.
+- ⚡ **AutoFill / Conditional UI**: Passive passkey suggestions directly in the QuickType keyboard bar on iOS & visionOS.
+- 🛡️ **Swift 6 Strict Concurrency**: Fully `@MainActor`-isolated and `Sendable`-checked with zero compiler warnings.
+- 🚫 **Leak-Free Cancellation**: Integrated with `withTaskCancellationHandler` to ensure system sheets dismiss and continuations resume cleanly on Task cancellation.
+- 🌐 **Built-in Base64URL (RFC 4648 §5)**: Native encoding/decoding and convenience properties on result payloads for direct WebAuthn JSON interoperability.
+- 🪟 **Smart Window Presentation Anchoring**: Automatically detects active foreground scenes on Stage Manager, multi-window iPadOS, and visionOS.
+- 🪶 **Zero Dependencies**: Pure Apple platform framework integration (`AuthenticationServices`).
+
+---
+
+## 📋 Requirements
+
+- **Platforms**: iOS 16.0+, macOS 13.0+, visionOS 1.0+ (enforced via `@available`)
   - *Note:* AutoFill / Conditional UI is supported on iOS and visionOS. On macOS and Mac Catalyst, button-triggered passkey sign-in is used.
-- Xcode 16+, Swift 6 language mode
-- A domain you control, with HTTPS and the ability to host a
-  `.well-known/apple-app-site-association` file
-- A WebAuthn-capable server (this package handles the client side)
+- **Toolchain**: Xcode 16+, Swift 6 language mode
+- **Domain**: An HTTPS domain you control hosting an `apple-app-site-association` file
+- **Server**: Any standard WebAuthn-compliant backend
 
-## Installation
+---
+
+## 📦 Installation
 
 ### Swift Package Manager (SPM)
 
 Add the dependency to your `Package.swift`:
 
-**Option 1: Tagged release (recommended once published)**
+**Option 1: Tagged release (recommended)**
 ```swift
 dependencies: [
     .package(url: "https://github.com/bhargavkukadiya/PasskeyManager.git", from: "1.0.0")
@@ -33,27 +54,30 @@ dependencies: [
 ]
 ```
 
-Or in Xcode: **File** → **Add Package Dependencies...** and enter the repository URL.
+### Xcode
+
+1. In Xcode, select **File** → **Add Package Dependencies...**
+2. Enter repository URL: `https://github.com/bhargavkukadiya/PasskeyManager.git`
+3. Select your version rules and add `PasskeyManager` to your target.
+
+### Manual Drop-in
 
 Alternatively, you can drag and drop `Sources/PasskeyManager/PasskeyManager.swift` directly into your Xcode project.
 
-## 1. One-time app setup
+---
 
-Passkeys are scoped to a **relying party identifier** (your bare domain, e.g.
-`example.com`) and require Apple to trust that your app is allowed to use it.
+## ⚙️ 1. App & Domain Setup
 
-**a. Add the Associated Domains capability**
+Passkeys are scoped to a **relying party identifier** (your domain, e.g. `example.com`) and require Apple to verify your app's association.
 
-In your target's *Signing & Capabilities*, add **Associated Domains** and an entry:
-
-```
+### a. Add Associated Domains Capability
+In your target's **Signing & Capabilities**, add **Associated Domains** and add:
+```text
 webcredentials:example.com
 ```
 
-**b. Host an `apple-app-site-association` file**
-
-At `https://example.com/.well-known/apple-app-site-association` (no file
-extension, served as `application/json`, no redirects):
+### b. Host `apple-app-site-association`
+At `https://example.com/.well-known/apple-app-site-association` (no file extension, served over HTTPS with `application/json`, no redirects):
 
 ```json
 {
@@ -62,74 +86,56 @@ extension, served as `application/json`, no redirects):
   }
 }
 ```
+*Replace `TEAMID` with your Apple Developer Team ID and `com.yourcompany.yourapp` with your App Bundle ID.*
 
-Replace `TEAMID` with your Apple Developer Team ID. Apple fetches and caches
-this file, so changes can take a little while to propagate — test on a real
-device, not just the simulator, when debugging this step.
+### c. (Optional) Share with Website
+If users also sign in on your website, add `"webauthn"` alongside `"webcredentials"` in your AASA file so credentials sync seamlessly across Safari and your native app via iCloud Keychain.
 
-**c. (Optional) Support your website too**
+---
 
-If users can also sign in on the web, add `"webauthn"` alongside
-`"webcredentials"` so passkeys are shared between your site and app via
-iCloud Keychain.
+## 🔄 2. The WebAuthn Ceremony
 
-## 2. What's in `PasskeyManager`
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant App as App (PasskeyManager)
+    participant Auth as Authenticator (Face ID / Touch ID)
+    participant Server as WebAuthn Server
 
-| Symbol | Purpose |
-|---|---|
-| `PasskeyManager.shared.register(...)` | Create a new passkey |
-| `PasskeyManager.shared.signIn(...)` | Sign in with an explicit button tap |
-| `PasskeyManager.shared.beginAutoFillAssistedSignIn(...)` | Passive sign-in via QuickType bar (iOS / visionOS) |
-| `PasskeyManager.shared.cancelAutoFillAssistedSignIn()` | Stop an in-flight AutoFill request |
-| `PasskeyManager.keyWindowAnchor()` | Grab the active key window as a presentation anchor |
-| `PasskeyCapability.isSupported` | OS-version capability check — callable without satisfying `PasskeyManager`'s `@available` gate |
-| `PasskeyCapability.isAutoFillSupported` | Checks if AutoFill passkey flow is supported on current OS & platform |
-| `Base64URL.encode` / `.decode` | Convert between `Data` and RFC 4648 §5 Base64URL |
-| `register`/`signIn`/`beginAutoFillAssistedSignIn` (Base64URL overloads) | Direct `String` overloads that decode server Base64URL values for you |
-| `PasskeyRegistrationResult`, `PasskeyAssertionResult` | Payloads with both `Data` and `Base64URL` accessors for easy JSON serialization |
-| `PasskeyError` | Typed, `LocalizedError`-conforming failure reasons |
+    Note over User,Server: Sign-in Flow
+    User->>App: Tap "Sign In with Passkey"
+    App->>Server: Request sign-in options / challenge
+    Server-->>App: Return challenge (Base64URL)
+    App->>Auth: PasskeyManager.shared.signIn(...)
+    Auth-->>User: Face ID / Touch ID Prompt
+    User-->>Auth: Confirms Biometrics
+    Auth-->>App: PasskeyAssertionResult
+    App->>Server: Send credentialID, signature, clientDataJSON (Base64URL)
+    Server-->>App: Verification OK & Session Issued
+    App-->>User: Authentication Complete!
+```
 
-## 3. The server contract
+---
 
-Passkeys follow the standard WebAuthn ceremony. Your server is responsible for
-generating challenges and validating signatures — this class only handles the
-on-device half.
+## 🚀 3. Usage Guide
 
-**Registration**
+### Registration (Creating a Passkey)
 
-1. Server → app: a fresh `challenge` (send as Base64URL, decode with
-   `Base64URL.decode(_:)`) and a `userID` (an opaque account identifier, *not*
-   the username/email).
-2. App → server: `credentialIDBase64URL`, `rawAttestationObjectBase64URL`,
-   `rawClientDataJSONBase64URL` from `PasskeyRegistrationResult`.
-3. Server verifies the attestation and stores the public key extracted from it,
-   keyed by `credentialID`.
-
-**Sign-in**
-
-1. Server → app: a fresh `challenge`.
-2. App → server: `credentialIDBase64URL`, `rawAuthenticatorDataBase64URL`, `signatureBase64URL`,
-   `rawClientDataJSONBase64URL` from `PasskeyAssertionResult`.
-3. Server looks up the stored public key for that `credentialID` and verifies
-   the signature over `authenticatorData || SHA-256(clientDataJSON)`.
-
-## 4. Usage
-
-**Registration**
-
-Use the Base64URL-string overload directly with what your server sends:
+Pass the Base64URL strings received from your backend directly:
 
 ```swift
 guard let anchor = PasskeyManager.keyWindowAnchor() else { return }
 
 let result = try await PasskeyManager.shared.register(
     relyingPartyIdentifier: "example.com",
-    userName: username,
+    userName: "alex_appleseed",
     userIDBase64URL: serverResponse.userID,
     challengeBase64URL: serverResponse.challenge,
     anchor: anchor
 )
 
+// Send Base64URL payloads to your backend
 try await api.finishRegistration(
     credentialID: result.credentialIDBase64URL,
     attestationObject: result.rawAttestationObjectBase64URL,
@@ -137,20 +143,18 @@ try await api.finishRegistration(
 )
 ```
 
-(A `Data`-based overload is also available if you've already decoded the
-challenge/user ID yourself.)
-
-**Sign-in (button tap)**
+### Sign-in (Button Tap)
 
 ```swift
 guard let anchor = PasskeyManager.keyWindowAnchor() else { return }
 
 let result = try await PasskeyManager.shared.signIn(
     relyingPartyIdentifier: "example.com",
-    challenge: challenge,
+    challengeBase64URL: serverResponse.challenge,
     anchor: anchor
 )
 
+// Send assertion to your backend
 try await api.finishSignIn(
     credentialID: result.credentialIDBase64URL,
     authenticatorData: result.rawAuthenticatorDataBase64URL,
@@ -159,16 +163,14 @@ try await api.finishSignIn(
 )
 ```
 
-**Sign-in (AutoFill / Conditional UI - iOS / visionOS)**
+### Sign-in with AutoFill (Conditional UI - iOS / visionOS)
 
-Mark your username field so the system knows it can offer passkeys there:
+Mark your username field with `.textContentType(.username)` and trigger AutoFill in `.task`:
 
 ```swift
 TextField("Username", text: $username)
     .textContentType(.username)
 ```
-
-Then kick off AutoFill early, in its own `Task`:
 
 ```swift
 .task {
@@ -176,41 +178,144 @@ Then kick off AutoFill early, in its own `Task`:
     do {
         let result = try await PasskeyManager.shared.beginAutoFillAssistedSignIn(
             relyingPartyIdentifier: "example.com",
-            challenge: challenge,
+            challengeBase64URL: challengeString,
             anchor: anchor
         )
-        // proceed with `result`
+        await handleSignInSuccess(result)
     } catch is CancellationError {
-        // view disappeared or request was cancelled — ignore
+        // View disappeared or Task cancelled — ignore
     } catch {
-        // real failure — surface it
+        // Handle error
     }
 }
 ```
 
-Call `PasskeyManager.shared.cancelAutoFillAssistedSignIn()` if the user starts
-typing a password instead, or when the screen disappears.
+---
 
-## 5. Error handling
+## 📱 4. Complete SwiftUI Example
 
-| `PasskeyError` case | Typical cause |
+```swift
+import SwiftUI
+import PasskeyManager
+
+struct SignInView: View {
+    @State private var username = ""
+    @State private var statusMessage = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Sign In") {
+                    TextField("Username", text: $username)
+                        .textContentType(.username)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+
+                    Button("Sign In with Passkey") {
+                        Task { await performExplicitSignIn() }
+                    }
+                }
+
+                if !statusMessage.isEmpty {
+                    Section {
+                        Text(statusMessage)
+                            .font(.footnote)
+                    }
+                }
+            }
+            .navigationTitle("Welcome")
+            // Passive AutoFill / Conditional UI
+            .task {
+                await performAutoFillSignIn()
+            }
+        }
+    }
+
+    private func performExplicitSignIn() async {
+        guard let anchor = PasskeyManager.keyWindowAnchor() else { return }
+        do {
+            let challenge = try await api.fetchSignInChallenge()
+            let assertion = try await PasskeyManager.shared.signIn(
+                relyingPartyIdentifier: "example.com",
+                challengeBase64URL: challenge,
+                anchor: anchor
+            )
+            try await api.completeSignIn(assertion: assertion)
+            statusMessage = "Signed in successfully!"
+        } catch PasskeyError.cancelled {
+            // User cancelled — no need to show an alert
+        } catch {
+            statusMessage = "Sign-in error: \(error.localizedDescription)"
+        }
+    }
+
+    private func performAutoFillSignIn() async {
+        guard PasskeyCapability.isAutoFillSupported,
+              let anchor = PasskeyManager.keyWindowAnchor() else { return }
+        do {
+            let challenge = try await api.fetchSignInChallenge()
+            let assertion = try await PasskeyManager.shared.beginAutoFillAssistedSignIn(
+                relyingPartyIdentifier: "example.com",
+                challengeBase64URL: challenge,
+                anchor: anchor
+            )
+            try await api.completeSignIn(assertion: assertion)
+            statusMessage = "AutoFill sign-in successful!"
+        } catch {
+            // Quietly ignore cancellations and missing credentials during AutoFill
+        }
+    }
+}
+```
+
+---
+
+## 📚 5. API Reference
+
+| Symbol | Description |
 |---|---|
-| `.cancelled` | User dismissed the sheet, or backgrounded the app |
-| `.noCredentialsAvailable` | No matching passkey exists for this RP on this account (common, expected during AutoFill) |
-| `.unexpectedCredentialType` | Mixed up a registration request with an assertion result, or vice versa |
-| `.missingAttestationObject` | Should not happen in practice; guards against a malformed response |
-| `.invalidChallenge` / `.invalidUserID` | Base64URL decoding failed on a string-based `register`/`signIn` call — check your server's encoding |
-| `.underlying(_)` | Any other `ASAuthorizationError`, including `.failed` (e.g. a misconfigured associated domain) — check `errorDescription` for detail |
+| `PasskeyManager.shared.register(...)` | Creates a new passkey with biometric/passcode confirmation |
+| `PasskeyManager.shared.signIn(...)` | Authenticates existing passkey via explicit sheet |
+| `PasskeyManager.shared.beginAutoFillAssistedSignIn(...)` | Passive AutoFill request tied to QuickType bar (iOS/visionOS) |
+| `PasskeyManager.shared.cancelAutoFillAssistedSignIn()` | Cancels an in-flight AutoFill request |
+| `PasskeyManager.keyWindowAnchor()` | Retrieves active foreground window presentation anchor |
+| `PasskeyCapability.isSupported` | Checks OS passkey support (callable from pre-iOS 16 call sites) |
+| `PasskeyCapability.isAutoFillSupported` | Checks if AutoFill passkey flow is supported on current OS & platform |
+| `Base64URL.encode(_:)` / `.decode(_:)` | Encodes/decodes between `Data` and RFC 4648 §5 Base64URL |
+| `PasskeyRegistrationResult` | Registration output payload with `Data` and `Base64URL` accessors |
+| `PasskeyAssertionResult` | Assertion output payload with `Data` and `Base64URL` accessors |
+| `PasskeyError` | Typed `LocalizedError` failures (`.cancelled`, `.noCredentialsAvailable`, etc.) |
 
-`.cancelled` and `.noCredentialsAvailable` are expected, routine outcomes —
-don't show an alert for them, especially from AutoFill.
+---
 
-## 6. Testing notes
+## ⚠️ 6. Error Handling
 
-- The simulator supports passkeys, but you must be signed into iCloud with
-  two-factor auth enabled and Passwords & Keychain syncing on (Settings →
-  your name → iCloud).
-- Test on a real device before shipping — the associated domain file fetch
-  and iCloud Keychain sync behave more reliably there.
-- To reset test credentials on a device: Settings → Passwords, find the
-  entry, and delete it.
+| `PasskeyError` | Typical Cause | Recommended Action |
+|---|---|---|
+| `.cancelled` | User dismissed the sheet or backgrounded the app | Ignore silently (expected user action) |
+| `.noCredentialsAvailable` | No matching passkey found on this device/account | Expected during AutoFill; fall back to password |
+| `.unexpectedCredentialType` | Authorization returned an unexpected credential type | Log diagnostic error |
+| `.missingAttestationObject` | Registration response lacked attestation data | Check authenticator configuration |
+| `.invalidChallenge` | Failed to Base64URL-decode server challenge | Verify backend challenge encoding |
+| `.invalidUserID` | Failed to Base64URL-decode server user handle | Verify backend user ID encoding |
+| `.underlying(message)` | OS-level error (e.g. Associated Domain misconfiguration) | Inspect `message` for debugging |
+
+---
+
+## 🧪 7. Testing Notes
+
+- **Simulator**: Passkeys are supported in the Simulator, but requires signing into an iCloud account with Two-Factor Authentication and iCloud Keychain enabled (**Settings** → **[Your Name]** → **iCloud** → **Passwords & Keychain**).
+- **Physical Device**: Always verify on a physical device prior to production — Associated Domain cache propagation and biometric prompts are most representative on hardware.
+- **Resetting Test Passkeys**: On your test device, navigate to **Settings** → **Passwords**, search for your test domain, and delete the passkey.
+
+---
+
+## 🤝 Contributing
+
+Contributions, bug reports, and feature requests are welcome! Feel free to check the [Issues](https://github.com/bhargavkukadiya/PasskeyManager/issues) page.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
