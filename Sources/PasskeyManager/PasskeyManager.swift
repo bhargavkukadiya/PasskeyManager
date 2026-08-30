@@ -7,11 +7,11 @@
 //  Covers:
 //    - Registration (creating a new passkey)
 //    - Sign-in with an explicit button tap
-//    - Sign-in with AutoFill / Conditional UI (tied to a username text field)
+//    - Sign-in with AutoFill / Conditional UI (iOS / visionOS)
 //    - Cancellation of an in-flight AutoFill request
 //    - Base64URL helpers for talking to a WebAuthn-compliant server
 //
-//  Requirements: iOS 16 / macOS 13 or later. Passkeys rely on an iCloud
+//  Requirements: iOS 16 / macOS 13 / visionOS 1 or later. Passkeys rely on an iCloud
 //  Keychain-backed platform authenticator, so the relying party identifier
 //  must match a domain with an associated apple-app-site-association file
 //  (`webcredentials` service) configured for your app.
@@ -28,8 +28,8 @@
 //      challengeBase64URL: serverResponse.challenge,
 //      anchor: anchor
 //  )
-//  // Send reg.credentialIDBase64URL, reg.rawAttestationObject,
-//  // reg.rawClientDataJSON to your server to finish registration.
+//  // Send reg.credentialIDBase64URL, reg.rawAttestationObjectBase64URL,
+//  // reg.rawClientDataJSONBase64URL to your server to finish registration.
 //
 //  // Sign-in
 //  let assertion = try await PasskeyManager.shared.signIn(
@@ -38,13 +38,15 @@
 //      anchor: anchor
 //  )
 //
-//  // AutoFill (call once, early, e.g. in viewDidAppear / .task on the
-//  // screen that owns the username field marked .textContentType(.username))
+//  // AutoFill (iOS/visionOS: call once, early, e.g. in viewDidAppear / .task
+//  // on the screen that owns the username field marked .textContentType(.username))
+//  #if (os(iOS) && !targetEnvironment(macCatalyst)) || os(visionOS)
 //  let assertion = try await PasskeyManager.shared.beginAutoFillAssistedSignIn(
 //      relyingPartyIdentifier: "example.com",
 //      challenge: challengeDataFromServer,
 //      anchor: anchor
 //  )
+//  #endif
 //  ─────────────────────────────────────────────────────────────────────
 
 import AuthenticationServices
@@ -61,7 +63,7 @@ import AppKit
 /// Whether platform passkeys are supported on this OS version.
 ///
 /// This lives outside `PasskeyManager` deliberately: `PasskeyManager` itself
-/// is `@available(iOS 16.0, macOS 13.0, *)`, so any call site that can
+/// is `@available(iOS 16.0, macOS 13.0, visionOS 1.0, *)`, so any call site that can
 /// already reference `PasskeyManager.isSupported` has, by definition,
 /// already satisfied that availability requirement — making such a check
 /// always `true` and therefore useless. This type carries no such
@@ -69,10 +71,22 @@ import AppKit
 /// to decide *whether* to branch into passkey-gated code at all.
 public enum PasskeyCapability {
     public static var isSupported: Bool {
-        if #available(iOS 16.0, macOS 13.0, *) {
+        if #available(iOS 16.0, macOS 13.0, visionOS 1.0, *) {
             return true
         }
         return false
+    }
+
+    /// Whether AutoFill-assisted sign-in (Conditional UI) is supported on this platform and OS version.
+    public static var isAutoFillSupported: Bool {
+        #if (os(iOS) && !targetEnvironment(macCatalyst)) || os(visionOS)
+        if #available(iOS 16.0, visionOS 1.0, *) {
+            return true
+        }
+        return false
+        #else
+        return false
+        #endif
     }
 }
 
@@ -80,14 +94,17 @@ public enum PasskeyCapability {
 
 /// WebAuthn challenges, user IDs, and credential IDs are exchanged with
 /// servers as Base64URL (RFC 4648 §5), not standard Base64.
-public enum Base64URL {
+public enum Base64URL: Sendable {
 
     public static func decode(_ string: String) -> Data? {
         var base64 = string
             .replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
         let paddingNeeded = base64.count % 4
-        if paddingNeeded > 0 {
+        if paddingNeeded == 1 {
+            // A single remainder character cannot form a valid Base64 payload.
+            return nil
+        } else if paddingNeeded > 1 {
             base64.append(String(repeating: "=", count: 4 - paddingNeeded))
         }
         return Data(base64Encoded: base64)
@@ -149,6 +166,21 @@ public struct PasskeyRegistrationResult: Sendable {
     public let rawClientDataJSON: Data
 
     public var credentialIDBase64URL: String { Base64URL.encode(credentialID) }
+    public var rawAttestationObjectBase64URL: String { Base64URL.encode(rawAttestationObject) }
+    public var rawClientDataJSONBase64URL: String { Base64URL.encode(rawClientDataJSON) }
+
+    /// UTF-8 string representation of `rawClientDataJSON`.
+    public var clientDataJSONString: String? { String(data: rawClientDataJSON, encoding: .utf8) }
+
+    public init(
+        credentialID: Data,
+        rawAttestationObject: Data,
+        rawClientDataJSON: Data
+    ) {
+        self.credentialID = credentialID
+        self.rawAttestationObject = rawAttestationObject
+        self.rawClientDataJSON = rawClientDataJSON
+    }
 }
 
 /// Everything a server needs to finish a WebAuthn `navigator.credentials.get()`-style
@@ -163,6 +195,27 @@ public struct PasskeyAssertionResult: Sendable {
     public let rawClientDataJSON: Data
 
     public var credentialIDBase64URL: String { Base64URL.encode(credentialID) }
+    public var rawAuthenticatorDataBase64URL: String { Base64URL.encode(rawAuthenticatorData) }
+    public var signatureBase64URL: String { Base64URL.encode(signature) }
+    public var userIDBase64URL: String? { userID.map { Base64URL.encode($0) } }
+    public var rawClientDataJSONBase64URL: String { Base64URL.encode(rawClientDataJSON) }
+
+    /// UTF-8 string representation of `rawClientDataJSON`.
+    public var clientDataJSONString: String? { String(data: rawClientDataJSON, encoding: .utf8) }
+
+    public init(
+        credentialID: Data,
+        rawAuthenticatorData: Data,
+        signature: Data,
+        userID: Data?,
+        rawClientDataJSON: Data
+    ) {
+        self.credentialID = credentialID
+        self.rawAuthenticatorData = rawAuthenticatorData
+        self.signature = signature
+        self.userID = userID
+        self.rawClientDataJSON = rawClientDataJSON
+    }
 }
 
 // MARK: - Delegate bridge
@@ -267,15 +320,17 @@ private final class PasskeyAuthorizationCoordinator: NSObject,
 
 // MARK: - PasskeyManager
 
-@available(iOS 16.0, macOS 13.0, *)
+@available(iOS 16.0, macOS 13.0, visionOS 1.0, *)
 @MainActor
 public final class PasskeyManager {
 
     public static let shared = PasskeyManager()
 
+    #if (os(iOS) && !targetEnvironment(macCatalyst)) || os(visionOS)
     /// Kept so an in-flight AutoFill request can be cancelled, e.g. when the
     /// user starts typing a password instead.
     private var autoFillController: ASAuthorizationController?
+    #endif
 
     private init() {}
 
@@ -396,9 +451,10 @@ public final class PasskeyManager {
 
     // MARK: Sign in with AutoFill (Conditional UI)
 
+    #if (os(iOS) && !targetEnvironment(macCatalyst)) || os(visionOS)
     /// Begins a passive, AutoFill-assisted passkey request. Call this once,
     /// early in the lifetime of your sign-in screen (e.g. from `.task {}` or
-    /// `viewDidAppear`), *before* the user interacts with anything. iOS
+    /// `viewDidAppear`), *before* the user interacts with anything. iOS/visionOS
     /// surfaces matching passkeys directly in the QuickType bar above the
     /// keyboard when the user taps a text field with
     /// `.textContentType(.username)`.
@@ -406,6 +462,7 @@ public final class PasskeyManager {
     /// This call suspends until the user picks a passkey (or cancels), so
     /// run it in its own `Task` rather than awaiting it inline in a view's
     /// body — it is not meant to block your UI.
+    @available(iOS 16.0, visionOS 1.0, *)
     public func beginAutoFillAssistedSignIn(
         relyingPartyIdentifier: String,
         challenge: Data,
@@ -416,10 +473,18 @@ public final class PasskeyManager {
         let request = provider.createCredentialAssertionRequest(challenge: challenge)
 
         let controller = ASAuthorizationController(authorizationRequests: [request])
+
+        // Cancel any existing in-flight AutoFill before starting a new one
+        autoFillController?.cancel()
         autoFillController = controller
+
         let coordinator = PasskeyAuthorizationCoordinator(anchor: anchor)
 
-        defer { autoFillController = nil }
+        defer {
+            if autoFillController === controller {
+                autoFillController = nil
+            }
+        }
 
         let authorization = try await performCancellable(controller, coordinator: coordinator) {
             controller.performAutoFillAssistedRequests()
@@ -435,6 +500,7 @@ public final class PasskeyManager {
         autoFillController?.cancel()
         autoFillController = nil
     }
+    #endif
 
     // MARK: Helpers
 
@@ -452,19 +518,27 @@ public final class PasskeyManager {
     }
 
     #if canImport(UIKit) && !os(watchOS) && !os(tvOS)
-    /// Convenience for grabbing the current key window as a presentation anchor.
-    /// Falls back to the first connected window scene's first window if no
-    /// window is currently marked key (e.g. very early in app launch).
+    /// Convenience for grabbing the active key window as a presentation anchor.
+    /// Safely handles multi-scene environments (iPadOS Stage Manager / multitasking / visionOS)
+    /// by prioritizing the active foreground scene.
     public static func keyWindowAnchor() -> ASPresentationAnchor? {
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        if let keyWindow = scenes.flatMap({ $0.windows }).first(where: { $0.isKeyWindow }) {
-            return keyWindow
+        let connectedScenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let activeScenes = connectedScenes.filter { $0.activationState == .foregroundActive }
+        let targetScenes = activeScenes.isEmpty ? connectedScenes : activeScenes
+
+        for scene in targetScenes {
+            if let keyWindow = scene.windows.first(where: { $0.isKeyWindow }) {
+                return keyWindow
+            }
         }
-        return scenes.first?.windows.first
+        return targetScenes.first?.windows.first(where: { !$0.isHidden })
     }
     #elseif canImport(AppKit)
+    /// Convenience for grabbing the key or main window as a presentation anchor on macOS.
     public static func keyWindowAnchor() -> ASPresentationAnchor? {
-        NSApplication.shared.keyWindow ?? NSApplication.shared.windows.first
+        NSApplication.shared.keyWindow
+            ?? NSApplication.shared.mainWindow
+            ?? NSApplication.shared.windows.first(where: { $0.isVisible && !$0.isMiniaturized })
     }
     #endif
 }
@@ -475,7 +549,7 @@ public final class PasskeyManager {
 /// strings in a JSON payload. These overloads decode them for you and throw
 /// `.invalidChallenge` / `.invalidUserID` on malformed input, rather than
 /// requiring every call site to force-unwrap `Base64URL.decode(_:)` itself.
-@available(iOS 16.0, macOS 13.0, *)
+@available(iOS 16.0, macOS 13.0, visionOS 1.0, *)
 public extension PasskeyManager {
 
     /// Creates a new passkey, decoding the server's Base64URL-encoded
@@ -534,12 +608,14 @@ public extension PasskeyManager {
         )
     }
 
+    #if (os(iOS) && !targetEnvironment(macCatalyst)) || os(visionOS)
     /// Begins a passive, AutoFill-assisted passkey request, decoding the
     /// server's Base64URL-encoded challenge string automatically.
     ///
     /// Throws ``PasskeyError/invalidChallenge`` if `challengeBase64URL` cannot
     /// be decoded. All other parameters and behavior are identical to the
     /// `Data`-based ``beginAutoFillAssistedSignIn(relyingPartyIdentifier:challenge:anchor:)``.
+    @available(iOS 16.0, visionOS 1.0, *)
     func beginAutoFillAssistedSignIn(
         relyingPartyIdentifier: String,
         challengeBase64URL: String,
@@ -554,4 +630,5 @@ public extension PasskeyManager {
             anchor: anchor
         )
     }
+    #endif
 }

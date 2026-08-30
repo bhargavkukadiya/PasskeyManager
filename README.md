@@ -6,11 +6,36 @@ exposed as `async`/`await`.
 
 ## Requirements
 
-- iOS 16 / macOS 13 or later (enforced via `@available`)
+- iOS 16+, macOS 13+, visionOS 1+ (enforced via `@available`)
+  - *Note:* AutoFill / Conditional UI is supported on iOS and visionOS. On macOS and Mac Catalyst, button-triggered passkey sign-in is used.
 - Xcode 16+, Swift 6 language mode
 - A domain you control, with HTTPS and the ability to host a
   `.well-known/apple-app-site-association` file
-- A WebAuthn-capable server (this file handles the client side only)
+- A WebAuthn-capable server (this package handles the client side)
+
+## Installation
+
+### Swift Package Manager (SPM)
+
+Add the dependency to your `Package.swift`:
+
+**Option 1: Tagged release (recommended once published)**
+```swift
+dependencies: [
+    .package(url: "https://github.com/bhargavkukadiya/PasskeyManager.git", from: "1.0.0")
+]
+```
+
+**Option 2: Main branch directly**
+```swift
+dependencies: [
+    .package(url: "https://github.com/bhargavkukadiya/PasskeyManager.git", branch: "main")
+]
+```
+
+Or in Xcode: **File** → **Add Package Dependencies...** and enter the repository URL.
+
+Alternatively, you can drag and drop `Sources/PasskeyManager/PasskeyManager.swift` directly into your Xcode project.
 
 ## 1. One-time app setup
 
@@ -48,19 +73,20 @@ If users can also sign in on the web, add `"webauthn"` alongside
 `"webcredentials"` so passkeys are shared between your site and app via
 iCloud Keychain.
 
-## 2. What's in `PasskeyManager.swift`
+## 2. What's in `PasskeyManager`
 
 | Symbol | Purpose |
 |---|---|
 | `PasskeyManager.shared.register(...)` | Create a new passkey |
 | `PasskeyManager.shared.signIn(...)` | Sign in with an explicit button tap |
-| `PasskeyManager.shared.beginAutoFillAssistedSignIn(...)` | Passive sign-in via the QuickType bar |
+| `PasskeyManager.shared.beginAutoFillAssistedSignIn(...)` | Passive sign-in via QuickType bar (iOS / visionOS) |
 | `PasskeyManager.shared.cancelAutoFillAssistedSignIn()` | Stop an in-flight AutoFill request |
-| `PasskeyManager.keyWindowAnchor()` | Grab the current window as a presentation anchor |
-| `PasskeyCapability.isSupported` | OS-version capability check — callable without first satisfying `PasskeyManager`'s own `@available` gate |
-| `Base64URL.encode` / `.decode` | Convert between `Data` and the Base64URL your server expects |
-| `register`/`signIn`/`beginAutoFillAssistedSignIn` (Base64URL string overloads) | Same three calls, but accepting `challengeBase64URL`/`userIDBase64URL` strings directly, decoding for you |
-| `PasskeyRegistrationResult`, `PasskeyAssertionResult` | Everything you send back to your server |
+| `PasskeyManager.keyWindowAnchor()` | Grab the active key window as a presentation anchor |
+| `PasskeyCapability.isSupported` | OS-version capability check — callable without satisfying `PasskeyManager`'s `@available` gate |
+| `PasskeyCapability.isAutoFillSupported` | Checks if AutoFill passkey flow is supported on current OS & platform |
+| `Base64URL.encode` / `.decode` | Convert between `Data` and RFC 4648 §5 Base64URL |
+| `register`/`signIn`/`beginAutoFillAssistedSignIn` (Base64URL overloads) | Direct `String` overloads that decode server Base64URL values for you |
+| `PasskeyRegistrationResult`, `PasskeyAssertionResult` | Payloads with both `Data` and `Base64URL` accessors for easy JSON serialization |
 | `PasskeyError` | Typed, `LocalizedError`-conforming failure reasons |
 
 ## 3. The server contract
@@ -74,16 +100,16 @@ on-device half.
 1. Server → app: a fresh `challenge` (send as Base64URL, decode with
    `Base64URL.decode(_:)`) and a `userID` (an opaque account identifier, *not*
    the username/email).
-2. App → server: `credentialIDBase64URL`, `rawAttestationObject`,
-   `rawClientDataJSON` from the `PasskeyRegistrationResult`.
+2. App → server: `credentialIDBase64URL`, `rawAttestationObjectBase64URL`,
+   `rawClientDataJSONBase64URL` from `PasskeyRegistrationResult`.
 3. Server verifies the attestation and stores the public key extracted from it,
    keyed by `credentialID`.
 
 **Sign-in**
 
 1. Server → app: a fresh `challenge`.
-2. App → server: `credentialIDBase64URL`, `rawAuthenticatorData`, `signature`,
-   `rawClientDataJSON` from the `PasskeyAssertionResult`.
+2. App → server: `credentialIDBase64URL`, `rawAuthenticatorDataBase64URL`, `signatureBase64URL`,
+   `rawClientDataJSONBase64URL` from `PasskeyAssertionResult`.
 3. Server looks up the stored public key for that `credentialID` and verifies
    the signature over `authenticatorData || SHA-256(clientDataJSON)`.
 
@@ -91,8 +117,7 @@ on-device half.
 
 **Registration**
 
-Use the Base64URL-string overload directly with what your server sends —
-no manual decoding or force-unwrapping needed:
+Use the Base64URL-string overload directly with what your server sends:
 
 ```swift
 guard let anchor = PasskeyManager.keyWindowAnchor() else { return }
@@ -107,8 +132,8 @@ let result = try await PasskeyManager.shared.register(
 
 try await api.finishRegistration(
     credentialID: result.credentialIDBase64URL,
-    attestationObject: result.rawAttestationObject,
-    clientDataJSON: result.rawClientDataJSON
+    attestationObject: result.rawAttestationObjectBase64URL,
+    clientDataJSON: result.rawClientDataJSONBase64URL
 )
 ```
 
@@ -125,9 +150,16 @@ let result = try await PasskeyManager.shared.signIn(
     challenge: challenge,
     anchor: anchor
 )
+
+try await api.finishSignIn(
+    credentialID: result.credentialIDBase64URL,
+    authenticatorData: result.rawAuthenticatorDataBase64URL,
+    signature: result.signatureBase64URL,
+    clientDataJSON: result.rawClientDataJSONBase64URL
+)
 ```
 
-**Sign-in (AutoFill / Conditional UI)**
+**Sign-in (AutoFill / Conditional UI - iOS / visionOS)**
 
 Mark your username field so the system knows it can offer passkeys there:
 
@@ -136,8 +168,7 @@ TextField("Username", text: $username)
     .textContentType(.username)
 ```
 
-Then kick off AutoFill early, in its own `Task` (it suspends until the user
-picks something, so don't await it inline in your view body):
+Then kick off AutoFill early, in its own `Task`:
 
 ```swift
 .task {
