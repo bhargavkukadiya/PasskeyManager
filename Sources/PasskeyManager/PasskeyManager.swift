@@ -160,8 +160,9 @@ public enum PasskeyError: LocalizedError, Sendable {
     case unexpectedCredentialType
     /// A registration response arrived without an attestation object.
     case missingAttestationObject
-    /// Registration matched one of `excludedCredentialIDs`: this
-    /// authenticator already holds a passkey for the account.
+    /// Registration matched one of `excludedCredentialIDs`: the user's
+    /// credential provider (e.g. iCloud Keychain, possibly synced from
+    /// another device) already holds a passkey for the account.
     case credentialAlreadyRegistered
     /// The server-supplied challenge string could not be Base64URL-decoded.
     case invalidChallenge
@@ -179,13 +180,13 @@ public enum PasskeyError: LocalizedError, Sendable {
         case .cancelled:
             return "The passkey request was cancelled."
         case .noCredentialsAvailable:
-            return "No passkeys were found for this request."
+            return "The passkey request couldn't be handled."
         case .unexpectedCredentialType:
             return "The authorization returned an unexpected credential type."
         case .missingAttestationObject:
             return "The registration response was missing its attestation object."
         case .credentialAlreadyRegistered:
-            return "A passkey for this account already exists on this device."
+            return "A passkey for this account already exists."
         case .invalidChallenge:
             return "The server challenge could not be decoded."
         case .invalidUserID:
@@ -551,9 +552,10 @@ public final class PasskeyManager {
     // MARK: Sign in with AutoFill (Conditional UI)
 
     #if (os(iOS) && !targetEnvironment(macCatalyst)) || os(visionOS)
-    /// Begins a passive, AutoFill-assisted passkey request. Call this once,
-    /// early in the lifetime of your sign-in screen (e.g. from `.task {}` or
-    /// `viewDidAppear`), *before* the user interacts with anything. iOS/visionOS
+    /// Begins a passive, AutoFill-assisted passkey request. Start it early in
+    /// the lifetime of your sign-in screen (e.g. from `.task {}` or
+    /// `viewDidAppear`), *before* the user interacts with anything, and again
+    /// whenever it has been superseded (see below). iOS/visionOS
     /// surfaces matching passkeys directly in the QuickType bar above the
     /// keyboard when the user taps a text field with
     /// `.textContentType(.username)`.

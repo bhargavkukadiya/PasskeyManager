@@ -132,10 +132,10 @@ final class PasskeyManagerTests: XCTestCase {
 
     func testErrorDescriptions() {
         XCTAssertEqual(PasskeyError.cancelled.errorDescription, "The passkey request was cancelled.")
-        XCTAssertEqual(PasskeyError.noCredentialsAvailable.errorDescription, "No passkeys were found for this request.")
+        XCTAssertEqual(PasskeyError.noCredentialsAvailable.errorDescription, "The passkey request couldn't be handled.")
         XCTAssertEqual(PasskeyError.unexpectedCredentialType.errorDescription, "The authorization returned an unexpected credential type.")
         XCTAssertEqual(PasskeyError.missingAttestationObject.errorDescription, "The registration response was missing its attestation object.")
-        XCTAssertEqual(PasskeyError.credentialAlreadyRegistered.errorDescription, "A passkey for this account already exists on this device.")
+        XCTAssertEqual(PasskeyError.credentialAlreadyRegistered.errorDescription, "A passkey for this account already exists.")
         XCTAssertEqual(PasskeyError.invalidChallenge.errorDescription, "The server challenge could not be decoded.")
         XCTAssertEqual(PasskeyError.invalidUserID.errorDescription, "The user identifier could not be decoded.")
         XCTAssertEqual(PasskeyError.invalidCredentialID.errorDescription, "A credential identifier could not be decoded.")
