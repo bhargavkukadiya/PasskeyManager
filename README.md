@@ -41,12 +41,12 @@ Handles registration, explicit sign-in, and passive AutoFill (Conditional UI) wi
 
 Add the dependency to your `Package.swift`:
 
-This README describes `main`. The `1.0.0` tag predates credential filtering and the updated cancellation/error behavior described below; use `main` for those APIs until a release includes them.
+These examples target `2.0.0`, which includes breaking API changes. If you're upgrading from `1.0.0`, follow the [migration guide](#migrating-from-100-to-200).
 
 **Option 1: Tagged release**
 ```swift
 dependencies: [
-    .package(url: "https://github.com/bhargavkukadiya/PasskeyManager.git", from: "1.0.0")
+    .package(url: "https://github.com/bhargavkukadiya/PasskeyManager.git", from: "2.0.0")
 ]
 ```
 
@@ -69,7 +69,7 @@ Alternatively, you can drag and drop `Sources/PasskeyManager/PasskeyManager.swif
 
 With a lower deployment target, guard calls to `PasskeyManager` with `if #available(iOS 16.0, macOS 13.0, visionOS 1.0, *)`. `PasskeyCapability.isSupported` reports OS availability only; it doesn't check saved passkeys, credential provider setup, or Associated Domains configuration.
 
-### Migrating from 1.0.0 to main
+### Migrating from 1.0.0 to 2.0.0
 
 - Handle `CancellationError` separately from `PasskeyError.cancelled`: task cancellation now resumes the caller directly, including when a failure callback arrives before the cancellation handler runs. A successful authorization that arrives first is still returned.
 - `PasskeyError.underlying` now contains `any Error` instead of `String`. Use `error.localizedDescription` for display, or cast to `ASAuthorizationError` to inspect its code. Non-authorization errors delivered by the controller are also wrapped in `.underlying`.
