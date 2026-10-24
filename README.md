@@ -1,9 +1,9 @@
 # PasskeyManager
 
 [![Swift 6.0](https://img.shields.io/badge/Swift-6.0-F05138.svg?style=flat&logo=swift)](https://swift.org)
-[![Platforms](https://img.shields.io/badge/Platforms-iOS%2016%2B%20%7C%20macOS%2013%20%7C%20visionOS%201%2B-blue.svg?style=flat)]()
+[![Platforms](https://img.shields.io/badge/Platforms-iOS%2016%2B%20%7C%20macOS%2013%2B%20%7C%20visionOS%201%2B-blue.svg?style=flat)](#-requirements)
 [![Swift Package Manager](https://img.shields.io/badge/SPM-Compatible-orange.svg?style=flat)](https://swift.org/package-manager/)
-[![Strict Concurrency](https://img.shields.io/badge/Swift%206-Strict%20Concurrency-brightgreen.svg?style=flat)]()
+[![Strict Concurrency](https://img.shields.io/badge/Swift%206-Strict%20Concurrency-brightgreen.svg?style=flat)](https://www.swift.org/documentation/concurrency/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat)](LICENSE)
 
 A lightweight, Swift 6 strict-concurrency-safe `async`/`await` wrapper around Apple's **AuthenticationServices** platform passkey (WebAuthn / FIDO2) APIs.
@@ -17,7 +17,8 @@ Handles registration, explicit sign-in, and passive AutoFill (Conditional UI) wi
 - 🔑 **Complete WebAuthn Ceremony**: Support for both credential creation (registration) and assertion (sign-in) ceremonies.
 - ⚡ **AutoFill / Conditional UI**: Passive passkey suggestions directly in the QuickType keyboard bar on iOS & visionOS.
 - 🛡️ **Swift 6 Strict Concurrency**: Fully `@MainActor`-isolated and `Sendable`-checked with zero compiler warnings.
-- 🚫 **Leak-Free Cancellation**: Integrated with `withTaskCancellationHandler` to ensure system sheets dismiss and continuations resume cleanly on Task cancellation.
+- 🚫 **Leak-Free Cancellation**: Cancelling the calling `Task` dismisses the system sheet and throws `CancellationError`, so it's never confused with the user tapping Cancel.
+- 🎯 **Credential Filtering**: `excludedCredentialIDs` on registration and `allowedCredentialIDs` on sign-in map to WebAuthn's `excludeCredentials` / `allowCredentials`.
 - 🌐 **Built-in Base64URL (RFC 4648 §5)**: Native encoding/decoding and convenience properties on result payloads for direct WebAuthn JSON interoperability.
 - 🪟 **Smart Window Presentation Anchoring**: Automatically detects active foreground scenes on Stage Manager, multi-window iPadOS, and visionOS.
 - 🪶 **Zero Dependencies**: Pure Apple platform framework integration (`AuthenticationServices`).
@@ -88,8 +89,8 @@ At `https://example.com/.well-known/apple-app-site-association` (no file extensi
 ```
 *Replace `TEAMID` with your Apple Developer Team ID and `com.yourcompany.yourapp` with your App Bundle ID.*
 
-### c. (Optional) Share with Website
-If users also sign in on your website, add `"webauthn"` alongside `"webcredentials"` in your AASA file so credentials sync seamlessly across Safari and your native app via iCloud Keychain.
+### c. Sharing Passkeys with Your Website
+No extra AASA entry is needed. The `webcredentials` entry above is what lets your app use passkeys for `example.com`, and those are the same passkeys Safari uses on `https://example.com`, synced through iCloud Keychain. Just make sure your website and app use the same relying party identifier.
 
 ---
 
@@ -111,7 +112,7 @@ sequenceDiagram
     Auth-->>User: Face ID / Touch ID Prompt
     User-->>Auth: Confirms Biometrics
     Auth-->>App: PasskeyAssertionResult
-    App->>Server: Send credentialID, signature, clientDataJSON (Base64URL)
+    App->>Server: Send credentialID, authenticatorData, signature, clientDataJSON, userHandle (Base64URL)
     Server-->>App: Verification OK & Session Issued
     App-->>User: Authentication Complete!
 ```
@@ -132,6 +133,9 @@ let result = try await PasskeyManager.shared.register(
     userName: "alex_appleseed",
     userIDBase64URL: serverResponse.userID,
     challengeBase64URL: serverResponse.challenge,
+    // Optional: the account's existing credential IDs (WebAuthn excludeCredentials),
+    // so the same device can't register a duplicate passkey. iOS 18 / macOS 15+.
+    excludedCredentialIDsBase64URL: serverResponse.excludeCredentials,
     anchor: anchor
 )
 
@@ -159,8 +163,31 @@ try await api.finishSignIn(
     credentialID: result.credentialIDBase64URL,
     authenticatorData: result.rawAuthenticatorDataBase64URL,
     signature: result.signatureBase64URL,
-    clientDataJSON: result.rawClientDataJSONBase64URL
+    clientDataJSON: result.rawClientDataJSONBase64URL,
+    // Identifies the account when the user picked a passkey without typing a username
+    userHandle: result.userIDBase64URL
 )
+```
+
+If the user has already entered a username, pass that account's credential IDs as `allowedCredentialIDsBase64URL:` (WebAuthn `allowCredentials`) to restrict the sheet to them.
+
+### Sign-in When the Screen Appears
+
+With `preferImmediatelyAvailableCredentials: true`, the sheet only appears if a passkey is already on this device. Otherwise it shows nothing and throws `.cancelled` straight away, so you can fall back to your password form:
+
+```swift
+do {
+    let result = try await PasskeyManager.shared.signIn(
+        relyingPartyIdentifier: "example.com",
+        challengeBase64URL: serverResponse.challenge,
+        anchor: anchor,
+        preferImmediatelyAvailableCredentials: true
+    )
+    // Finish sign-in with your backend
+} catch PasskeyError.cancelled {
+    // No passkey on this device, or the user dismissed the sheet
+    showPasswordForm()
+}
 ```
 
 ### Sign-in with AutoFill (Conditional UI - iOS / visionOS)
@@ -184,11 +211,15 @@ TextField("Username", text: $username)
         await handleSignInSuccess(result)
     } catch is CancellationError {
         // View disappeared or Task cancelled — ignore
+    } catch PasskeyError.cancelled {
+        // Superseded by an explicit signIn/register, or cancelAutoFillAssistedSignIn()
     } catch {
         // Handle error
     }
 }
 ```
+
+`signIn(...)` and `register(...)` cancel any in-flight AutoFill request before showing their sheet. AutoFill isn't restarted automatically, so start it again if the user comes back to the username field.
 
 ---
 
@@ -261,8 +292,12 @@ struct SignInView: View {
             )
             try await api.completeSignIn(assertion: assertion)
             statusMessage = "AutoFill sign-in successful!"
+        } catch is CancellationError {
+            // View disappeared
+        } catch PasskeyError.cancelled, PasskeyError.noCredentialsAvailable {
+            // Superseded by the button, or nothing to offer — expected during AutoFill
         } catch {
-            // Quietly ignore cancellations and missing credentials during AutoFill
+            statusMessage = "Sign-in error: \(error.localizedDescription)"
         }
     }
 }
@@ -278,8 +313,8 @@ struct SignInView: View {
 | `PasskeyManager.shared.signIn(...)` | Authenticates existing passkey via explicit sheet |
 | `PasskeyManager.shared.beginAutoFillAssistedSignIn(...)` | Passive AutoFill request tied to QuickType bar (iOS/visionOS) |
 | `PasskeyManager.shared.cancelAutoFillAssistedSignIn()` | Cancels an in-flight AutoFill request |
-| `PasskeyManager.keyWindowAnchor()` | Retrieves active foreground window presentation anchor |
-| `PasskeyCapability.isSupported` | Checks OS passkey support (callable from pre-iOS 16 call sites) |
+| `PasskeyManager.keyWindowAnchor()` | Retrieves a foreground window as the presentation anchor (not available in app extensions) |
+| `PasskeyCapability.isSupported` | Checks OS passkey support from pre-iOS 16 code. Only useful with the manual drop-in: via SPM the package already requires iOS 16 / macOS 13, so it's always `true` |
 | `PasskeyCapability.isAutoFillSupported` | Checks if AutoFill passkey flow is supported on current OS & platform |
 | `Base64URL.encode(_:)` / `.decode(_:)` | Encodes/decodes between `Data` and RFC 4648 §5 Base64URL |
 | `PasskeyRegistrationResult` | Registration output payload with `Data` and `Base64URL` accessors |
@@ -290,15 +325,18 @@ struct SignInView: View {
 
 ## ⚠️ 6. Error Handling
 
-| `PasskeyError` | Typical Cause | Recommended Action |
+| Error | Typical Cause | Recommended Action |
 |---|---|---|
-| `.cancelled` | User dismissed the sheet or backgrounded the app | Ignore silently (expected user action) |
-| `.noCredentialsAvailable` | No matching passkey found on this device/account | Expected during AutoFill; fall back to password |
+| `CancellationError` | The calling `Task` was cancelled (e.g. the view disappeared) | Ignore silently |
+| `.cancelled` | User dismissed the sheet; **or** `preferImmediatelyAvailableCredentials: true` found no passkey on this device; **or** an AutoFill request was superseded | With `preferImmediatelyAvailableCredentials`, fall back to your password form; otherwise ignore |
+| `.noCredentialsAvailable` | The system didn't handle the request (`ASAuthorizationError.notHandled`) | Fall back to another sign-in method |
 | `.unexpectedCredentialType` | Authorization returned an unexpected credential type | Log diagnostic error |
 | `.missingAttestationObject` | Registration response lacked attestation data | Check authenticator configuration |
+| `.credentialAlreadyRegistered` | Registration matched one of `excludedCredentialIDs` | Tell the user they already have a passkey |
 | `.invalidChallenge` | Failed to Base64URL-decode server challenge | Verify backend challenge encoding |
 | `.invalidUserID` | Failed to Base64URL-decode server user handle | Verify backend user ID encoding |
-| `.underlying(message)` | OS-level error (e.g. Associated Domain misconfiguration) | Inspect `message` for debugging |
+| `.invalidCredentialID` | Failed to Base64URL-decode an allowed/excluded credential ID | Verify backend credential ID encoding |
+| `.underlying(error)` | Any other error, e.g. an `ASAuthorizationError` with code `.failed` (often an Associated Domains misconfiguration) | Inspect `error` — cast to `ASAuthorizationError` to check its `code` |
 
 ---
 

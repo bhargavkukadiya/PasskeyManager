@@ -69,6 +69,11 @@ import AppKit
 /// always `true` and therefore useless. This type carries no such
 /// annotation, so it can be called from code with a lower deployment target
 /// to decide *whether* to branch into passkey-gated code at all.
+///
+/// When consumed through Swift Package Manager, the package already requires
+/// iOS 16 / macOS 13 / visionOS 1, so `isSupported` is always `true`; it only
+/// matters when this file is dropped into a project with a lower deployment
+/// target.
 public enum PasskeyCapability {
     public static var isSupported: Bool {
         if #available(iOS 16.0, macOS 13.0, visionOS 1.0, *) {
@@ -96,7 +101,14 @@ public enum PasskeyCapability {
 /// servers as Base64URL (RFC 4648 §5), not standard Base64.
 public enum Base64URL: Sendable {
 
+    /// Decodes a Base64URL string. Trailing `=` padding is optional, since
+    /// WebAuthn omits it. Returns `nil` for anything else — including the
+    /// standard-Base64 `+` and `/` characters, which mean the server used the
+    /// wrong alphabet.
     public static func decode(_ string: String) -> Data? {
+        guard !string.contains(where: { $0 == "+" || $0 == "/" }) else {
+            return nil
+        }
         var base64 = string
             .replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
@@ -110,6 +122,7 @@ public enum Base64URL: Sendable {
         return Data(base64Encoded: base64)
     }
 
+    /// Encodes `data` as unpadded Base64URL, as WebAuthn expects.
     public static func encode(_ data: Data) -> String {
         data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
@@ -120,21 +133,41 @@ public enum Base64URL: Sendable {
 
 // MARK: - Errors
 
+/// Errors thrown by `PasskeyManager`.
+///
+/// Cancelling the calling `Task` throws `CancellationError` rather than any
+/// of these, so you can tell "the view went away" apart from "the user
+/// dismissed the sheet".
 public enum PasskeyError: LocalizedError, Sendable {
-    /// The user dismissed the passkey sheet or backgrounded the app mid-request.
+    /// The system reported the request as cancelled. This covers:
+    /// - the user dismissing the passkey sheet or backgrounding the app;
+    /// - `signIn(…, preferImmediatelyAvailableCredentials: true)` finding no
+    ///   passkey on this device, in which case no sheet was shown — fall back
+    ///   to your password form;
+    /// - an AutoFill request being superseded by another request or by
+    ///   `cancelAutoFillAssistedSignIn()`.
     case cancelled
-    /// No matching passkeys exist for this request (e.g. AutoFill with an empty account).
+    /// The system didn't handle the request (`ASAuthorizationError.Code.notHandled`),
+    /// e.g. no credential provider could satisfy it. Fall back to another
+    /// sign-in method.
     case noCredentialsAvailable
     /// The authorization returned a credential type we didn't ask for.
     case unexpectedCredentialType
     /// A registration response arrived without an attestation object.
     case missingAttestationObject
+    /// Registration matched one of `excludedCredentialIDs`: this
+    /// authenticator already holds a passkey for the account.
+    case credentialAlreadyRegistered
     /// The server-supplied challenge string could not be Base64URL-decoded.
     case invalidChallenge
-    /// The server-supplied user identifier could not be encoded to `Data`.
+    /// The server-supplied user identifier could not be Base64URL-decoded.
     case invalidUserID
-    /// Any other underlying error surfaced by AuthenticationServices.
-    case underlying(String)
+    /// A server-supplied credential ID string could not be Base64URL-decoded.
+    case invalidCredentialID
+    /// Any other error, preserved so callers can inspect it — typically an
+    /// `ASAuthorizationError` whose `code` is e.g. `.failed`,
+    /// `.invalidResponse` or `.notInteractive`.
+    case underlying(any Error)
 
     public var errorDescription: String? {
         switch self {
@@ -146,12 +179,16 @@ public enum PasskeyError: LocalizedError, Sendable {
             return "The authorization returned an unexpected credential type."
         case .missingAttestationObject:
             return "The registration response was missing its attestation object."
+        case .credentialAlreadyRegistered:
+            return "A passkey for this account already exists on this device."
         case .invalidChallenge:
             return "The server challenge could not be decoded."
         case .invalidUserID:
-            return "The user identifier could not be encoded."
-        case .underlying(let message):
-            return message
+            return "The user identifier could not be decoded."
+        case .invalidCredentialID:
+            return "A credential identifier could not be decoded."
+        case .underlying(let error):
+            return error.localizedDescription
         }
     }
 }
@@ -231,13 +268,18 @@ public struct PasskeyAssertionResult: Sendable {
 /// `MainActor.assumeIsolated`, which is safe here because
 /// `ASAuthorizationController` always delivers its callbacks on the main
 /// thread.
+@available(iOS 16.0, macOS 13.0, visionOS 1.0, *)
 @MainActor
-private final class PasskeyAuthorizationCoordinator: NSObject,
+final class PasskeyAuthorizationCoordinator: NSObject,
     ASAuthorizationControllerDelegate,
     ASAuthorizationControllerPresentationContextProviding {
 
     private let anchor: ASPresentationAnchor
     private var continuation: CheckedContinuation<ASAuthorization, Error>?
+    /// The controller whose request is in flight, kept so Task cancellation
+    /// can cancel it. Cleared once the request finishes.
+    private var controller: ASAuthorizationController?
+    private var isUsed = false
 
     init(anchor: ASPresentationAnchor) {
         self.anchor = anchor
@@ -245,31 +287,93 @@ private final class PasskeyAuthorizationCoordinator: NSObject,
 
     /// Wires this instance up as `controller`'s delegate, calls `start`
     /// (which should invoke one of `performRequests(options:)`), and
-    /// suspends until a delegate callback fires exactly once.
+    /// suspends until the request finishes.
+    ///
+    /// If the enclosing `Task` is cancelled (e.g. a SwiftUI `.task {}` view
+    /// disappearing), this throws `CancellationError` straight away and
+    /// cancels the request. `CheckedContinuation` doesn't resume on
+    /// cancellation by itself, so without this a cancelled caller would stay
+    /// suspended until the system responded. If the Task is already
+    /// cancelled, `start` is never called.
+    ///
+    /// A failure that arrives while the Task is cancelled is always reported
+    /// as `CancellationError`, even if the delegate callback beat the
+    /// cancellation handler's main-actor hop. A success in that window is
+    /// still returned, since the user did complete the ceremony.
     ///
     /// Each coordinator is single-use: it is created fresh per request and
-    /// discarded afterwards, so overlapping calls on the same instance would
-    /// indicate a misuse of this type rather than a supported scenario.
+    /// discarded afterwards, so reusing an instance would indicate a misuse
+    /// of this type rather than a supported scenario.
     func perform(on controller: ASAuthorizationController, start: () -> Void) async throws -> ASAuthorization {
-        precondition(continuation == nil, "PasskeyAuthorizationCoordinator is single-use; create a new instance per request.")
+        precondition(!isUsed, "PasskeyAuthorizationCoordinator is single-use; create a new instance per request.")
+        isUsed = true
 
         controller.delegate = self
         controller.presentationContextProvider = self
 
-        return try await withCheckedThrowingContinuation { continuation in
-            self.continuation = continuation
-            start()
+        do {
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    self.continuation = continuation
+                    if Task.isCancelled {
+                        finish(.failure(CancellationError()))
+                    } else {
+                        self.controller = controller
+                        start()
+                    }
+                }
+            } onCancel: {
+                Task { @MainActor in
+                    self.cancel()
+                }
+            }
+        } catch {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            throw error
         }
+    }
+
+    /// Resumes the caller with `CancellationError` and cancels the in-flight
+    /// request. The delegate callback the system makes in response is
+    /// ignored, since the continuation has already been consumed.
+    private func cancel() {
+        let inFlight = controller
+        finish(.failure(CancellationError()))
+        inFlight?.cancel()
     }
 
     private func finish(_ result: Result<ASAuthorization, Error>) {
         let pending = continuation
         continuation = nil
+        controller = nil
         switch result {
         case .success(let authorization):
             pending?.resume(returning: authorization)
         case .failure(let error):
             pending?.resume(throwing: error)
+        }
+    }
+
+    /// Translates an error delivered by `ASAuthorizationController` into a
+    /// `PasskeyError`, keeping the original error for anything without a
+    /// dedicated case.
+    nonisolated static func mapError(_ error: Error) -> PasskeyError {
+        guard let authError = error as? ASAuthorizationError else {
+            return .underlying(error)
+        }
+        switch authError.code {
+        case .canceled:
+            return .cancelled
+        case .notHandled:
+            return .noCredentialsAvailable
+        default:
+            if #available(iOS 18.0, macOS 15.0, visionOS 2.0, *),
+               authError.code == .matchedExcludedCredential {
+                return .credentialAlreadyRegistered
+            }
+            return .underlying(authError)
         }
     }
 
@@ -286,26 +390,7 @@ private final class PasskeyAuthorizationCoordinator: NSObject,
         controller: ASAuthorizationController,
         didCompleteWithError error: Error
     ) {
-        let mapped: Error
-        if let authError = error as? ASAuthorizationError {
-            switch authError.code {
-            case .canceled:
-                mapped = PasskeyError.cancelled
-            case .notHandled:
-                // No matching credential for this request — the routine,
-                // expected outcome during AutoFill with no saved passkeys.
-                mapped = PasskeyError.noCredentialsAvailable
-            case .failed:
-                // Broader failure category (e.g. a misconfigured associated
-                // domain, or the authenticator rejecting the request) —
-                // preserve the detail instead of masking it as "no credentials".
-                mapped = PasskeyError.underlying(authError.localizedDescription)
-            default:
-                mapped = PasskeyError.underlying(authError.localizedDescription)
-            }
-        } else {
-            mapped = error
-        }
+        let mapped = Self.mapError(error)
         MainActor.assumeIsolated {
             finish(.failure(mapped))
         }
@@ -334,36 +419,6 @@ public final class PasskeyManager {
 
     private init() {}
 
-    // MARK: Cancellation-aware execution
-
-    /// Runs `controller` via `coordinator`, and cancels `controller` if the
-    /// enclosing `Task` is cancelled (e.g. a SwiftUI `.task {}` view
-    /// disappearing) so the underlying request — and its continuation —
-    /// never leak.
-    ///
-    /// `CheckedContinuation` does not automatically resume on `Task`
-    /// cancellation, so without this, a cancelled caller would leave the
-    /// passkey sheet's continuation permanently suspended.
-    private func performCancellable(
-        _ controller: ASAuthorizationController,
-        coordinator: PasskeyAuthorizationCoordinator,
-        start: @escaping () -> Void
-    ) async throws -> ASAuthorization {
-        // `ASAuthorizationController` isn't marked `Sendable`, but it's only
-        // ever touched here (immediately, on the main actor) and inside
-        // `onCancel` below (also hopped onto the main actor before use), so
-        // capturing it across the `@Sendable` `onCancel` closure is safe.
-        nonisolated(unsafe) let controller = controller
-
-        return try await withTaskCancellationHandler {
-            try await coordinator.perform(on: controller, start: start)
-        } onCancel: {
-            Task { @MainActor in
-                controller.cancel()
-            }
-        }
-    }
-
     // MARK: Registration
 
     /// Creates a new passkey for `relyingPartyIdentifier` and presents the
@@ -376,7 +431,15 @@ public final class PasskeyManager {
     ///   - challenge: A fresh, single-use challenge issued by your server.
     ///   - userVerification: Whether biometric/passcode verification is requested, required, or skipped.
     ///   - attestation: Attestation statement preference to request from the authenticator.
+    ///   - excludedCredentialIDs: Credential IDs already registered for this
+    ///     account (WebAuthn `excludeCredentials`). If the authenticator holds
+    ///     one of them, registration fails with
+    ///     ``PasskeyError/credentialAlreadyRegistered`` instead of creating a
+    ///     duplicate passkey. Honored on iOS 18 / macOS 15 and later; ignored
+    ///     on visionOS and earlier OS versions.
     ///   - anchor: The window to present the passkey sheet from.
+    ///
+    /// On iOS and visionOS, this cancels any in-flight AutoFill request first.
     public func register(
         relyingPartyIdentifier: String,
         userName: String,
@@ -384,6 +447,7 @@ public final class PasskeyManager {
         challenge: Data,
         userVerification: ASAuthorizationPublicKeyCredentialUserVerificationPreference = .preferred,
         attestation: ASAuthorizationPublicKeyCredentialAttestationKind = .none,
+        excludedCredentialIDs: [Data] = [],
         anchor: ASPresentationAnchor
     ) async throws -> PasskeyRegistrationResult {
         try Task.checkCancellation()
@@ -395,11 +459,19 @@ public final class PasskeyManager {
         )
         request.userVerificationPreference = userVerification
         request.attestationPreference = attestation
+        #if !os(visionOS)
+        if #available(iOS 18.0, macOS 15.0, *), !excludedCredentialIDs.isEmpty {
+            request.excludedCredentials = excludedCredentialIDs.map(
+                ASAuthorizationPlatformPublicKeyCredentialDescriptor.init(credentialID:)
+            )
+        }
+        #endif
 
+        cancelAutoFillBeforeModalRequest()
         let controller = ASAuthorizationController(authorizationRequests: [request])
         let coordinator = PasskeyAuthorizationCoordinator(anchor: anchor)
 
-        let authorization = try await performCancellable(controller, coordinator: coordinator) {
+        let authorization = try await coordinator.perform(on: controller) {
             controller.performRequests()
         }
 
@@ -421,24 +493,38 @@ public final class PasskeyManager {
 
     /// Prompts the user to authenticate with an existing passkey.
     ///
-    /// - Parameter preferImmediatelyAvailableCredentials: When `true`, the
-    ///   system skips iCloud Keychain lookup delays and only offers
-    ///   credentials already available on-device — useful right after a
-    ///   password sign-in to offer a quick passkey upgrade prompt.
+    /// On iOS and visionOS, this cancels any in-flight AutoFill request first.
+    ///
+    /// - Parameters:
+    ///   - allowedCredentialIDs: When non-empty, only these credentials
+    ///     (WebAuthn `allowCredentials`) may be used to sign in — e.g. after
+    ///     the user has typed a username. Leave empty to let the user pick
+    ///     any passkey for the relying party.
+    ///   - preferImmediatelyAvailableCredentials: When `true`, the system
+    ///     shows a sheet only if a passkey for this relying party is already
+    ///     on this device (no QR code / nearby-device option). If there is
+    ///     none, it shows no UI and throws ``PasskeyError/cancelled``
+    ///     immediately. Use this when your sign-in screen first appears, and
+    ///     fall back to your password form on `.cancelled`.
     public func signIn(
         relyingPartyIdentifier: String,
         challenge: Data,
+        allowedCredentialIDs: [Data] = [],
         anchor: ASPresentationAnchor,
         preferImmediatelyAvailableCredentials: Bool = false
     ) async throws -> PasskeyAssertionResult {
         try Task.checkCancellation()
         let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: relyingPartyIdentifier)
         let request = provider.createCredentialAssertionRequest(challenge: challenge)
+        request.allowedCredentials = allowedCredentialIDs.map(
+            ASAuthorizationPlatformPublicKeyCredentialDescriptor.init(credentialID:)
+        )
 
+        cancelAutoFillBeforeModalRequest()
         let controller = ASAuthorizationController(authorizationRequests: [request])
         let coordinator = PasskeyAuthorizationCoordinator(anchor: anchor)
 
-        let authorization = try await performCancellable(controller, coordinator: coordinator) {
+        let authorization = try await coordinator.perform(on: controller) {
             if preferImmediatelyAvailableCredentials {
                 controller.performRequests(options: .preferImmediatelyAvailableCredentials)
             } else {
@@ -462,7 +548,12 @@ public final class PasskeyManager {
     /// This call suspends until the user picks a passkey (or cancels), so
     /// run it in its own `Task` rather than awaiting it inline in a view's
     /// body — it is not meant to block your UI.
-    @available(iOS 16.0, visionOS 1.0, *)
+    ///
+    /// Throws ``PasskeyError/cancelled`` if the request is superseded by
+    /// another AutoFill request, a `signIn` / `register` call, or
+    /// `cancelAutoFillAssistedSignIn()`. It isn't restarted automatically, so
+    /// call this again if the user returns to the sign-in field. Cancelling
+    /// the enclosing `Task` throws `CancellationError`.
     public func beginAutoFillAssistedSignIn(
         relyingPartyIdentifier: String,
         challenge: Data,
@@ -486,7 +577,7 @@ public final class PasskeyManager {
             }
         }
 
-        let authorization = try await performCancellable(controller, coordinator: coordinator) {
+        let authorization = try await coordinator.perform(on: controller) {
             controller.performAutoFillAssistedRequests()
         }
 
@@ -504,6 +595,14 @@ public final class PasskeyManager {
 
     // MARK: Helpers
 
+    /// Apple's guidance is to cancel a running AutoFill request before
+    /// starting a modal one, so the two never compete for the same sheet.
+    private func cancelAutoFillBeforeModalRequest() {
+        #if (os(iOS) && !targetEnvironment(macCatalyst)) || os(visionOS)
+        cancelAutoFillAssistedSignIn()
+        #endif
+    }
+
     private static func assertionResult(from authorization: ASAuthorization) throws -> PasskeyAssertionResult {
         guard let credential = authorization.credential as? ASAuthorizationPlatformPublicKeyCredentialAssertion else {
             throw PasskeyError.unexpectedCredentialType
@@ -518,20 +617,29 @@ public final class PasskeyManager {
     }
 
     #if canImport(UIKit) && !os(watchOS) && !os(tvOS)
-    /// Convenience for grabbing the active key window as a presentation anchor.
-    /// Safely handles multi-scene environments (iPadOS Stage Manager / multitasking / visionOS)
-    /// by prioritizing the active foreground scene.
+    /// Convenience for grabbing a foreground window as a presentation anchor.
+    /// Handles multi-scene environments (iPadOS Stage Manager / multitasking / visionOS)
+    /// by preferring foreground-active scenes, then foreground-inactive ones (e.g. during
+    /// launch). Windows of backgrounded scenes are never returned, since the passkey
+    /// sheet can't be shown from them.
+    ///
+    /// Unavailable in app extensions, which can't reach `UIApplication.shared`;
+    /// pass the extension's own window as the anchor instead.
+    @available(iOSApplicationExtension, unavailable)
+    @available(macCatalystApplicationExtension, unavailable)
+    @available(visionOSApplicationExtension, unavailable)
     public static func keyWindowAnchor() -> ASPresentationAnchor? {
         let connectedScenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        let activeScenes = connectedScenes.filter { $0.activationState == .foregroundActive }
-        let targetScenes = activeScenes.isEmpty ? connectedScenes : activeScenes
 
-        for scene in targetScenes {
-            if let keyWindow = scene.windows.first(where: { $0.isKeyWindow }) {
-                return keyWindow
+        for state in [UIScene.ActivationState.foregroundActive, .foregroundInactive] {
+            let windows = connectedScenes
+                .filter { $0.activationState == state }
+                .flatMap(\.windows)
+            if let window = windows.first(where: \.isKeyWindow) ?? windows.first(where: { !$0.isHidden }) {
+                return window
             }
         }
-        return targetScenes.first?.windows.first(where: { !$0.isHidden })
+        return nil
     }
     #elseif canImport(AppKit)
     /// Convenience for grabbing the key or main window as a presentation anchor on macOS.
@@ -547,18 +655,19 @@ public final class PasskeyManager {
 
 /// Most WebAuthn servers hand back challenges and user IDs as Base64URL
 /// strings in a JSON payload. These overloads decode them for you and throw
-/// `.invalidChallenge` / `.invalidUserID` on malformed input, rather than
-/// requiring every call site to force-unwrap `Base64URL.decode(_:)` itself.
+/// `.invalidChallenge` / `.invalidUserID` / `.invalidCredentialID` on
+/// malformed input, rather than requiring every call site to force-unwrap
+/// `Base64URL.decode(_:)` itself.
 @available(iOS 16.0, macOS 13.0, visionOS 1.0, *)
 public extension PasskeyManager {
 
     /// Creates a new passkey, decoding the server's Base64URL-encoded
-    /// challenge and user ID strings automatically.
+    /// challenge, user ID and excluded credential ID strings automatically.
     ///
-    /// Throws ``PasskeyError/invalidChallenge`` if `challengeBase64URL` cannot
-    /// be decoded, or ``PasskeyError/invalidUserID`` if `userIDBase64URL`
+    /// Throws ``PasskeyError/invalidChallenge``, ``PasskeyError/invalidUserID``
+    /// or ``PasskeyError/invalidCredentialID`` if the corresponding input
     /// cannot be decoded. All other parameters and behavior are identical to
-    /// the `Data`-based ``register(relyingPartyIdentifier:userName:userID:challenge:userVerification:attestation:anchor:)``.
+    /// the `Data`-based ``register(relyingPartyIdentifier:userName:userID:challenge:userVerification:attestation:excludedCredentialIDs:anchor:)``.
     func register(
         relyingPartyIdentifier: String,
         userName: String,
@@ -566,6 +675,7 @@ public extension PasskeyManager {
         challengeBase64URL: String,
         userVerification: ASAuthorizationPublicKeyCredentialUserVerificationPreference = .preferred,
         attestation: ASAuthorizationPublicKeyCredentialAttestationKind = .none,
+        excludedCredentialIDsBase64URL: [String] = [],
         anchor: ASPresentationAnchor
     ) async throws -> PasskeyRegistrationResult {
         guard let challenge = Base64URL.decode(challengeBase64URL) else {
@@ -581,19 +691,23 @@ public extension PasskeyManager {
             challenge: challenge,
             userVerification: userVerification,
             attestation: attestation,
+            excludedCredentialIDs: Self.decodeCredentialIDs(excludedCredentialIDsBase64URL),
             anchor: anchor
         )
     }
 
     /// Prompts the user to authenticate with an existing passkey, decoding
-    /// the server's Base64URL-encoded challenge string automatically.
+    /// the server's Base64URL-encoded challenge and allowed credential ID
+    /// strings automatically.
     ///
-    /// Throws ``PasskeyError/invalidChallenge`` if `challengeBase64URL` cannot
+    /// Throws ``PasskeyError/invalidChallenge`` or
+    /// ``PasskeyError/invalidCredentialID`` if the corresponding input cannot
     /// be decoded. All other parameters and behavior are identical to the
-    /// `Data`-based ``signIn(relyingPartyIdentifier:challenge:anchor:preferImmediatelyAvailableCredentials:)``.
+    /// `Data`-based ``signIn(relyingPartyIdentifier:challenge:allowedCredentialIDs:anchor:preferImmediatelyAvailableCredentials:)``.
     func signIn(
         relyingPartyIdentifier: String,
         challengeBase64URL: String,
+        allowedCredentialIDsBase64URL: [String] = [],
         anchor: ASPresentationAnchor,
         preferImmediatelyAvailableCredentials: Bool = false
     ) async throws -> PasskeyAssertionResult {
@@ -603,6 +717,7 @@ public extension PasskeyManager {
         return try await signIn(
             relyingPartyIdentifier: relyingPartyIdentifier,
             challenge: challenge,
+            allowedCredentialIDs: Self.decodeCredentialIDs(allowedCredentialIDsBase64URL),
             anchor: anchor,
             preferImmediatelyAvailableCredentials: preferImmediatelyAvailableCredentials
         )
@@ -615,7 +730,6 @@ public extension PasskeyManager {
     /// Throws ``PasskeyError/invalidChallenge`` if `challengeBase64URL` cannot
     /// be decoded. All other parameters and behavior are identical to the
     /// `Data`-based ``beginAutoFillAssistedSignIn(relyingPartyIdentifier:challenge:anchor:)``.
-    @available(iOS 16.0, visionOS 1.0, *)
     func beginAutoFillAssistedSignIn(
         relyingPartyIdentifier: String,
         challengeBase64URL: String,
@@ -631,4 +745,13 @@ public extension PasskeyManager {
         )
     }
     #endif
+
+    private static func decodeCredentialIDs(_ strings: [String]) throws -> [Data] {
+        try strings.map { string in
+            guard let data = Base64URL.decode(string) else {
+                throw PasskeyError.invalidCredentialID
+            }
+            return data
+        }
+    }
 }
