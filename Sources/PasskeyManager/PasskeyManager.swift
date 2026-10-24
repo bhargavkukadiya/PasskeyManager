@@ -11,10 +11,10 @@
 //    - Cancellation of an in-flight AutoFill request
 //    - Base64URL helpers for talking to a WebAuthn-compliant server
 //
-//  Requirements: iOS 16 / macOS 13 / visionOS 1 or later. Passkeys rely on an iCloud
-//  Keychain-backed platform authenticator, so the relying party identifier
-//  must match a domain with an associated apple-app-site-association file
-//  (`webcredentials` service) configured for your app.
+//  Requirements: iOS 16 / macOS 13 / visionOS 1 or later. The relying party
+//  identifier must match a domain with an associated
+//  apple-app-site-association file (`webcredentials` service) configured
+//  for your app.
 //
 //  ── Quick usage ──────────────────────────────────────────────────────
 //
@@ -64,7 +64,7 @@ import AppKit
 ///
 /// This lives outside `PasskeyManager` deliberately: `PasskeyManager` itself
 /// is `@available(iOS 16.0, macOS 13.0, visionOS 1.0, *)`, so any call site that can
-/// already reference `PasskeyManager.isSupported` has, by definition,
+/// already reference `PasskeyManager` has, by definition,
 /// already satisfied that availability requirement — making such a check
 /// always `true` and therefore useless. This type carries no such
 /// annotation, so it can be called from code with a lower deployment target
@@ -73,7 +73,8 @@ import AppKit
 /// When consumed through Swift Package Manager, the package already requires
 /// iOS 16 / macOS 13 / visionOS 1, so `isSupported` is always `true`; it only
 /// matters when this file is dropped into a project with a lower deployment
-/// target.
+/// target. These checks only report API availability, not saved credentials,
+/// credential provider setup, or Associated Domains configuration.
 public enum PasskeyCapability {
     public static var isSupported: Bool {
         if #available(iOS 16.0, macOS 13.0, visionOS 1.0, *) {
@@ -135,9 +136,13 @@ public enum Base64URL: Sendable {
 
 /// Errors thrown by `PasskeyManager`.
 ///
-/// Cancelling the calling `Task` throws `CancellationError` rather than any
-/// of these, so you can tell "the view went away" apart from "the user
-/// dismissed the sheet".
+/// Once input has been decoded, cancelling the calling `Task` cancels a
+/// pending authorization and throws `CancellationError` rather than any of
+/// these. A failure the system reports while the Task is being cancelled is
+/// also reported as `CancellationError`. A successful authorization that
+/// wins the race is still returned, so checks on its result
+/// (``missingAttestationObject``, ``unexpectedCredentialType``) can still
+/// throw.
 public enum PasskeyError: LocalizedError, Sendable {
     /// The system reported the request as cancelled. This covers:
     /// - the user dismissing the passkey sheet or backgrounding the app;
@@ -290,8 +295,9 @@ final class PasskeyAuthorizationCoordinator: NSObject,
     /// suspends until the request finishes.
     ///
     /// If the enclosing `Task` is cancelled (e.g. a SwiftUI `.task {}` view
-    /// disappearing), this throws `CancellationError` straight away and
-    /// cancels the request. `CheckedContinuation` doesn't resume on
+    /// disappearing), its cancellation handler hops to the main actor to
+    /// resume with `CancellationError` and cancel the request.
+    /// `CheckedContinuation` doesn't resume on
     /// cancellation by itself, so without this a cancelled caller would stay
     /// suspended until the system responded. If the Task is already
     /// cancelled, `start` is never called.
@@ -405,6 +411,12 @@ final class PasskeyAuthorizationCoordinator: NSObject,
 
 // MARK: - PasskeyManager
 
+/// Performs platform passkey requests on the main actor.
+///
+/// Cancelling the calling Task cancels a pending authorization and throws
+/// `CancellationError`. If a successful authorization wins the cancellation
+/// race, that result is still returned. A failure the system reports while
+/// the Task is being cancelled is reported as `CancellationError`.
 @available(iOS 16.0, macOS 13.0, visionOS 1.0, *)
 @MainActor
 public final class PasskeyManager {
@@ -435,8 +447,8 @@ public final class PasskeyManager {
     ///     account (WebAuthn `excludeCredentials`). If the authenticator holds
     ///     one of them, registration fails with
     ///     ``PasskeyError/credentialAlreadyRegistered`` instead of creating a
-    ///     duplicate passkey. Honored on iOS 18 / macOS 15 and later; ignored
-    ///     on visionOS and earlier OS versions.
+    ///     duplicate passkey. Honored on iOS / Mac Catalyst 18 and macOS 15
+    ///     and later; ignored on visionOS and earlier OS versions.
     ///   - anchor: The window to present the passkey sheet from.
     ///
     /// On iOS and visionOS, this cancels any in-flight AutoFill request first.
@@ -501,8 +513,9 @@ public final class PasskeyManager {
     ///     the user has typed a username. Leave empty to let the user pick
     ///     any passkey for the relying party.
     ///   - preferImmediatelyAvailableCredentials: When `true`, the system
-    ///     shows a sheet only if a passkey for this relying party is already
-    ///     on this device (no QR code / nearby-device option). If there is
+    ///     shows a sheet only if a matching passkey is immediately available
+    ///     on this device (no QR code / nearby-device option). Any supplied
+    ///     `allowedCredentialIDs` must also match. If there is
     ///     none, it shows no UI and throws ``PasskeyError/cancelled``
     ///     immediately. Use this when your sign-in screen first appears, and
     ///     fall back to your password form on `.cancelled`.
@@ -553,7 +566,8 @@ public final class PasskeyManager {
     /// another AutoFill request, a `signIn` / `register` call, or
     /// `cancelAutoFillAssistedSignIn()`. It isn't restarted automatically, so
     /// call this again if the user returns to the sign-in field. Cancelling
-    /// the enclosing `Task` throws `CancellationError`.
+    /// the enclosing `Task` throws `CancellationError` unless a successful
+    /// authorization wins the cancellation race.
     public func beginAutoFillAssistedSignIn(
         relyingPartyIdentifier: String,
         challenge: Data,
